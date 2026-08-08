@@ -17,13 +17,14 @@ MRVN is a Discord music player bot. It has a few neat features:
  - `/play [query or url]` adds a song to your queue and starts playback in the
    channel if required.
  - `/pause` pauses the current song playing your voice channel.
- - `/play` unpauses the current song, or makes the bot start playing if you have
-   previously queued songs.
+ - `/resume` unpauses the current song, or makes the bot start playing if you
+   have previously queued songs.
  - `/skip` skips the current song, or votes to skip if it you weren't the
    original queue-er. The number of votes needed is configurable.
  - `/stop` skips the current song and doesn't play any more queued songs. Use
-   `/play` to continue playback.
+   `/resume` to continue playback.
  - `/replace` replaces your most recently queued song.
+ - `/nowplaying` shows the current song and how far through it you are.
  - Queue management is not implemented yet.
 
 ## Set up
@@ -83,7 +84,11 @@ First off you need to setup your environment:
  1. Ensure you have the required dependencies installed:
     - [Git](https://git-scm.com/)
     - [Rustup](https://rustup.rs/)
-    - [youtube-dl](https://youtube-dl.org/)
+    - [yt-dlp](https://github.com/yt-dlp/yt-dlp), plus a JavaScript runtime such
+      as [Deno](https://deno.com/) for sites that need one. The `ytdl.name`
+      field in your config file must match the name of the binary — the example
+      config says `youtube-dl`, which is the name the Docker image installs
+      yt-dlp under.
  2. Clone the repository by running `git clone https://github.com/cpdt/mrvn-bot`
 
 Once that's done, you can run the following command from inside the repository any time you want to start MRVN. Make sure to replace `/path/to/config.json` with the path to your configuration file saved previously.
