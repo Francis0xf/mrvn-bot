@@ -18,6 +18,7 @@ impl std::error::Error for EncryptionNotSupportedError {}
 
 pub fn media_file_stream(
     base_url: url::Url,
+    headers: reqwest::header::HeaderMap,
     segments: impl Stream<Item = io::Result<m3u8_rs::MediaSegment>> + Send + 'static,
 ) -> impl Stream<Item = io::Result<Bytes>> {
     // This looks like a mess, but roughly we're:
@@ -31,6 +32,7 @@ pub fn media_file_stream(
     segments
         .and_then(move |segment| {
             let base_url = base_url.clone();
+            let headers = headers.clone();
 
             async move {
                 let base_url = base_url.clone();
@@ -46,7 +48,9 @@ pub fn media_file_stream(
                 // todo: support encryption
 
                 let absolute_url = base_url.join(&segment.uri).map_err(io::Error::other)?;
-                let builder = HTTP_CLIENT.get(absolute_url);
+                // Segments need the same headers as the playlist: hosts that authenticate the
+                // playlist request generally authenticate segment requests too.
+                let builder = HTTP_CLIENT.get(absolute_url).headers(headers);
                 Ok(builder.send().map(Ok))
             }
         })

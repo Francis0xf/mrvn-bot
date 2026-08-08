@@ -75,12 +75,6 @@ enum ChannelPlayingState {
     },
 }
 
-impl ChannelPlayingState {
-    fn is_playing(&self) -> bool {
-        matches!(self, ChannelPlayingState::Playing { .. })
-    }
-}
-
 pub struct ChannelActionMessage {
     pub frontend_handle: Box<dyn Any + Send + Sync>,
 }
@@ -241,10 +235,14 @@ impl<QueueEntry> GuildModel<QueueEntry> {
             stop_votes: HashSet::new(),
         };
 
-        // Remove any empty queues and channels
+        // Remove any empty queues, and any channel we're not keeping state for. Dropping a
+        // channel that is stopped would lose that flag and restart playback there, and dropping
+        // one that holds an action message deletes that message from Discord.
         self.queues.retain(|queue| !queue.entries.is_empty());
-        self.channels
-            .retain(|_, channel| channel.playing.is_playing());
+        self.channels.retain(|_, channel| {
+            !matches!(channel.playing, ChannelPlayingState::NotPlaying)
+                || channel.last_action_message.is_some()
+        });
 
         Some(next_entry)
     }
@@ -294,7 +292,7 @@ impl<QueueEntry> GuildModel<QueueEntry> {
 
                 // We can skip immediately if the user who played this entry is not in the channel
                 // anymore.
-                if !is_user_in_voice_channel(cache, guild_id, channel_id, user_id) {
+                if !is_user_in_voice_channel(cache, guild_id, channel_id, *playing_user_id) {
                     return VoteStatus::Success;
                 }
 

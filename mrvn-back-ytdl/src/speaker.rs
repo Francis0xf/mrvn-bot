@@ -228,11 +228,6 @@ impl<'handle> GuildSpeakerRef<'handle> {
         Ok(())
     }
 
-    pub fn unlock(&mut self) {
-        self.guild_speaker.playing_state = None;
-        self.guild_speaker.last_ended_time = Some(Instant::now());
-    }
-
     pub fn stop(&mut self) -> Result<(), crate::Error> {
         if let Some(playing_state) = &mut self.guild_speaker.playing_state {
             playing_state

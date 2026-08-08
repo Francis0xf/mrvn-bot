@@ -157,9 +157,9 @@ async fn update_playing_message_loop(mut metadata: ActivePlayingActionMetadata) 
     let update_period_secs = match metadata.song_metadata.duration_seconds {
         Some(duration) => {
             let time_width = format_time(&metadata.frontend.config, 0., Some(duration)).len();
-            let progress_width =
-                (MAX_COLUMNS - time_width - BEFORE_PROGRESS_BAR.len() - AFTER_PROGRESS_BAR.len())
-                    .max(1);
+            let progress_width = MAX_COLUMNS
+                .saturating_sub(time_width + BEFORE_PROGRESS_BAR.len() + AFTER_PROGRESS_BAR.len())
+                .max(1);
             (duration / progress_width as f64).clamp(min_update_secs, max_update_secs)
         }
         None => max_update_secs,

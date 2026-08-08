@@ -6,6 +6,7 @@ pub enum Error {
     UnknownCommand(String),
     NoGuild,
     ModelPlayingSpeakerNotDesync,
+    MissingResolvedSongs,
 }
 
 impl std::fmt::Display for Error {
@@ -18,6 +19,10 @@ impl std::fmt::Display for Error {
             Error::ModelPlayingSpeakerNotDesync => write!(
                 f,
                 "Out of sync: model says song is playing, but the speaker disagrees"
+            ),
+            Error::MissingResolvedSongs => write!(
+                f,
+                "A command needing a resolved query was dispatched without one"
             ),
         }
     }

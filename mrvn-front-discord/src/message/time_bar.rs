@@ -37,9 +37,9 @@ pub fn format_time_bar(
     let time = format_time(config, time_seconds, duration_seconds);
     let progress_str = match duration_seconds {
         Some(duration) => {
-            let width =
-                (MAX_COLUMNS - time.len() - BEFORE_PROGRESS_BAR.len() - AFTER_PROGRESS_BAR.len())
-                    .max(1);
+            let width = MAX_COLUMNS
+                .saturating_sub(time.len() + BEFORE_PROGRESS_BAR.len() + AFTER_PROGRESS_BAR.len())
+                .max(1);
             let progress = (time_seconds / duration).clamp(0., 1.);
             let progress_width = (width as f64 * progress) as usize;
 

@@ -9,8 +9,13 @@ mod media_segment_stream;
 
 pub fn hls_chunks(
     base_url: url::Url,
+    headers: reqwest::header::HeaderMap,
     initial_response: reqwest::Response,
     request_builder: reqwest::RequestBuilder,
 ) -> impl Stream<Item = io::Result<Bytes>> {
-    media_file_stream(base_url, segment_stream(initial_response, request_builder))
+    media_file_stream(
+        base_url,
+        headers,
+        segment_stream(initial_response, request_builder),
+    )
 }

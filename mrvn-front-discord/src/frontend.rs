@@ -36,6 +36,14 @@ enum QueuedSongsMetadata {
     Multiple(usize),
 }
 
+/// The outcome of resolving a command's query, which happens before the guild is locked.
+enum ResolvedSongs {
+    Songs(Vec<Song>),
+    /// A failure we have user-facing wording for.
+    Failed(ResponseMessage),
+    Error(mrvn_back_ytdl::Error),
+}
+
 pub struct Frontend {
     pub config: Arc<Config>,
     pub backend_brain: Brain,
@@ -105,6 +113,7 @@ impl Frontend {
         // This signal is used to cancel sending a "loading..." message when we finish executing
         // the command.
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let (deferred_done_tx, deferred_done_rx) = tokio::sync::oneshot::channel();
         let send_deferred_message_future = async {
             let show_deferred_message = futures::select!(
                 _ = rx.fuse() => false,
@@ -120,9 +129,15 @@ impl Frontend {
             {
                 log::error!("Error while sending deferred message: {}", why);
             }
+            let _ = deferred_done_tx.send(());
         };
 
         let send_future = async {
+            // Resolving a query runs youtube-dl, which can take many seconds. Do it before
+            // taking the guild lock, otherwise every other command in the guild queues up
+            // behind this one.
+            let resolved_songs = self.resolve_command_songs(command).await;
+
             // Ensure we have the guild locked for the duration of the command.
             let guild_model_handle = self.model.get(guild_id);
             let mut guild_model = guild_model_handle.lock().await;
@@ -130,13 +145,24 @@ impl Frontend {
 
             // Execute the command
             let messages_res = self
-                .handle_guild_command(ctx, command, guild_id, guild_model.deref_mut())
+                .handle_guild_command(
+                    ctx,
+                    command,
+                    guild_id,
+                    guild_model.deref_mut(),
+                    resolved_songs,
+                )
                 .await;
 
             // If the timeout has finished, rx will be closed so this send call will return an
             // error. We can use this to know that a response has been created, and we need to edit
             // it from now on.
             let has_sent_deferred = tx.send(()).is_err();
+            if has_sent_deferred {
+                // The deferred response may still be in flight; editing it before it lands
+                // would fail.
+                let _ = deferred_done_rx.await;
+            }
             let messages = messages_res.map_err(if has_sent_deferred {
                 HandleCommandError::EditError
             } else {
@@ -165,43 +191,64 @@ impl Frontend {
         send_res
     }
 
+    /// Runs youtube-dl for the commands that take a query. Kept separate from handling so it can
+    /// run before the guild is locked. Returns `None` for commands that don't take a query.
+    async fn resolve_command_songs(&self, command: &CommandInteraction) -> Option<ResolvedSongs> {
+        match command.data.name.as_str() {
+            name @ ("play" | "replace") => {
+                let term = command_term(command);
+                log::debug!("Received {} \"{}\"", name, term);
+                Some(
+                    match Song::load(term, command.user.id, &self.config.get_play_config()).await {
+                        Ok(songs) => ResolvedSongs::Songs(songs),
+                        Err(mrvn_back_ytdl::Error::UnsupportedUrl) => {
+                            ResolvedSongs::Failed(ResponseMessage::UnsupportedSiteError)
+                        }
+                        Err(why) => ResolvedSongs::Error(why),
+                    },
+                )
+            }
+            _ => None,
+        }
+    }
+
     async fn handle_guild_command(
         self: &Arc<Self>,
         ctx: &Context,
         command: &CommandInteraction,
         guild_id: GuildId,
         guild_model: &mut GuildModel<QueuedSong>,
+        resolved_songs: Option<ResolvedSongs>,
     ) -> Result<Vec<crate::message::Message>, crate::error::Error> {
         let user_id = command.user.id;
         match command.data.name.as_str() {
-            "play" => {
-                let term = command
-                    .data
-                    .options
-                    .first()
-                    .and_then(|option| option.value.as_str())
-                    .unwrap_or_default();
-                log::debug!("Received play \"{}\"", term);
-                self.handle_queue_play_command(ctx, user_id, guild_id, guild_model, term)
-                    .await
-            }
+            "play" => match resolved_songs.ok_or(crate::error::Error::MissingResolvedSongs)? {
+                ResolvedSongs::Songs(songs) => {
+                    self.handle_queue_play_command(ctx, user_id, guild_id, guild_model, songs)
+                        .await
+                }
+                ResolvedSongs::Failed(message) => Ok(vec![Message::Response {
+                    message,
+                    delegate: None,
+                }]),
+                ResolvedSongs::Error(why) => Err(crate::error::Error::Backend(why)),
+            },
             "resume" => {
                 log::debug!("Received resume");
                 self.handle_unpause_command(ctx, user_id, guild_id, guild_model)
                     .await
             }
-            "replace" => {
-                let term = command
-                    .data
-                    .options
-                    .first()
-                    .and_then(|option| option.value.as_str())
-                    .unwrap_or_default();
-
-                log::debug!("Received replace \"{}\"", term);
-                self.handle_replace_command(ctx, user_id, guild_id, guild_model, term)
-                    .await
-            }
+            "replace" => match resolved_songs.ok_or(crate::error::Error::MissingResolvedSongs)? {
+                ResolvedSongs::Songs(songs) => {
+                    self.handle_replace_command(ctx, user_id, guild_id, guild_model, songs)
+                        .await
+                }
+                ResolvedSongs::Failed(message) => Ok(vec![Message::Response {
+                    message,
+                    delegate: None,
+                }]),
+                ResolvedSongs::Error(why) => Err(crate::error::Error::Backend(why)),
+            },
             "pause" => {
                 log::debug!("Received pause");
                 self.handle_pause_command(ctx, user_id, guild_id).await
@@ -232,21 +279,8 @@ impl Frontend {
         user_id: UserId,
         guild_id: GuildId,
         guild_model: &mut GuildModel<QueuedSong>,
-        term: &str,
+        songs: Vec<Song>,
     ) -> Result<Vec<crate::message::Message>, crate::error::Error> {
-        let play_config = self.config.get_play_config();
-
-        let songs = match Song::load(term, user_id, &play_config).await {
-            Ok(data) => data,
-            Err(mrvn_back_ytdl::Error::UnsupportedUrl) => {
-                return Ok(vec![Message::Response {
-                    message: ResponseMessage::UnsupportedSiteError,
-                    delegate: None,
-                }]);
-            }
-            Err(why) => return Err(crate::error::Error::Backend(why)),
-        };
-
         if songs.is_empty() {
             return Ok(vec![Message::Response {
                 message: ResponseMessage::NoMatchingSongsError,
@@ -515,21 +549,8 @@ impl Frontend {
         user_id: UserId,
         guild_id: GuildId,
         guild_model: &mut GuildModel<QueuedSong>,
-        term: &str,
+        songs: Vec<Song>,
     ) -> Result<Vec<crate::message::Message>, crate::error::Error> {
-        let play_config = self.config.get_play_config();
-
-        let songs = match Song::load(term, user_id, &play_config).await {
-            Ok(data) => data,
-            Err(mrvn_back_ytdl::Error::UnsupportedUrl) => {
-                return Ok(vec![Message::Response {
-                    message: ResponseMessage::UnsupportedSiteError,
-                    delegate: None,
-                }]);
-            }
-            Err(why) => return Err(crate::error::Error::Backend(why)),
-        };
-
         if songs.len() == 1 {
             let song_metadata = &songs[0].metadata;
             log::trace!(
@@ -1163,6 +1184,15 @@ impl EndedHandler for EndedDelegate {
             ended_handle,
         ));
     }
+}
+
+fn command_term(command: &CommandInteraction) -> &str {
+    command
+        .data
+        .options
+        .first()
+        .and_then(|option| option.value.as_str())
+        .unwrap_or_default()
 }
 
 fn get_user_voice_channel(

@@ -82,6 +82,57 @@ fn parse_ytdl_line(line: &str, user_id: UserId) -> Result<Song, Error> {
     })
 }
 
+/// Rewrites YouTube links into a canonical form, dropping tracking and playlist-position
+/// parameters that can confuse youtube-dl. Returns `None` for any link we don't know how to
+/// rewrite, in which case the original URL should be passed through untouched.
+fn normalize_youtube_url(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    let host = host.strip_prefix("www.").unwrap_or(host);
+
+    let (path, video_id) = match host {
+        "youtube.com" | "m.youtube.com" | "music.youtube.com" => {
+            let mut video_id = None;
+            let mut playlist_id = None;
+            for (key, value) in url.query_pairs() {
+                match &*key {
+                    "v" if video_id.is_none() => video_id = Some(value.into_owned()),
+                    "list" if playlist_id.is_none() => playlist_id = Some(value.into_owned()),
+                    _ => {}
+                }
+            }
+
+            // A link to a video within a playlist plays just that video, matching what a user
+            // sees when they open the link themselves.
+            match (video_id, playlist_id) {
+                (Some(video_id), _) => ("watch", ("v", video_id)),
+                (None, Some(playlist_id)) => ("playlist", ("list", playlist_id)),
+                // Channel pages, /shorts, /live and friends have no parameters worth keeping.
+                (None, None) => return None,
+            }
+        }
+        "youtu.be" => {
+            // Unlike query_pairs(), path() hands back percent-encoded text, so it has to be
+            // decoded here or it gets encoded a second time below.
+            let video_id = url.path().trim_matches('/');
+            if video_id.is_empty() {
+                return None;
+            }
+            let video_id = percent_encoding::percent_decode_str(video_id)
+                .decode_utf8_lossy()
+                .into_owned();
+            ("watch", ("v", video_id))
+        }
+        _ => return None,
+    };
+
+    let mut normalized = Url::parse("https://www.youtube.com/").ok()?;
+    normalized.set_path(path);
+    normalized
+        .query_pairs_mut()
+        .append_pair(video_id.0, &video_id.1);
+    Some(normalized.into())
+}
+
 impl Song {
     pub async fn load(
         term: &str,
@@ -101,37 +152,13 @@ impl Song {
                     }
                 }
 
-                Cow::Borrowed(term)
+                match normalize_youtube_url(&url) {
+                    Some(normalized) => Cow::Owned(normalized),
+                    None => Cow::Borrowed(term),
+                }
             }
             Err(_) => Cow::Owned(format!("{}:{}", config.search_prefix, &term)),
         };
-
-        let mut safe_url = ytdl_url.to_string();
-
-        // handling youtube playlist and video urls
-        if ytdl_url.contains("https://www.youtube.com") {
-            let parsed = Url::parse(&ytdl_url);
-            match parsed {
-                Ok(url) => {
-                    let params: Vec<_> = url.query_pairs().collect();
-                    safe_url = format!("https://youtube.com/watch?{}={}", params[0].0, params[0].1)
-                }
-                Err(_) => return Err(Error::UnsupportedUrl),
-            }
-        }
-
-        if ytdl_url.contains("https://youtu.be") {
-            let parsed = Url::parse(&ytdl_url);
-            match parsed {
-                Ok(url) => {
-                    safe_url = format!(
-                        "https://youtube.com/watch?v={}",
-                        url.path().replace("/", "")
-                    )
-                }
-                Err(_) => return Err(Error::UnsupportedUrl),
-            }
-        }
 
         let mut ytdl = TokioCommand::new(config.ytdl_name)
             .args(config.ytdl_args)
@@ -139,20 +166,46 @@ impl Song {
                 "--dump-json",
                 "--ignore-config",
                 "--no-warnings",
-                safe_url.as_ref(),
+                ytdl_url.as_ref(),
                 "-o",
                 "-",
             ])
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
+            // Without this a youtube-dl process outlives an early return, writing to a pipe
+            // nobody is reading from.
+            .kill_on_drop(true)
             .spawn()
             .map_err(Error::Io)?;
         let mut lines = BufReader::new(ytdl.stderr.take().unwrap()).lines();
 
+        // youtube-dl writes one JSON object per resolved song, and reports per-song problems
+        // inline. A single unusable entry (a region-locked video in a playlist, say) shouldn't
+        // lose the songs that did resolve, so errors are only reported if nothing resolved.
         let mut songs = Vec::new();
+        let mut last_error = None;
         while let Some(line) = lines.next_line().await.map_err(Error::Io)? {
-            songs.push(parse_ytdl_line(&line, user_id)?);
+            if line.trim().is_empty() {
+                continue;
+            }
+            match parse_ytdl_line(&line, user_id) {
+                Ok(song) => songs.push(song),
+                Err(why) => {
+                    log::warn!("Ignoring unusable youtube-dl output: {}", why);
+                    last_error = Some(why);
+                }
+            }
+        }
+
+        let status = ytdl.wait().await.map_err(Error::Io)?;
+        if songs.is_empty() {
+            if let Some(why) = last_error {
+                return Err(why);
+            }
+            if !status.success() {
+                return Err(Error::Ytdl(format!("youtube-dl exited with {}", status)));
+            }
         }
 
         Ok(songs)
@@ -177,6 +230,7 @@ impl Song {
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
             .map_err(Error::Io)?;
         let first_line = BufReader::new(ytdl.stderr.take().unwrap())
@@ -217,17 +271,22 @@ impl Song {
         let parsed_download_url =
             url::Url::parse(&self.download_url).map_err(|_| Error::UnsupportedUrl)?;
 
-        // Start streaming data from the remote
+        // Start streaming data from the remote. Headers come from whatever extractor youtube-dl
+        // used, so an unusable one is skipped rather than failing the whole play.
         let mut headers = reqwest::header::HeaderMap::new();
         for (key, value) in &self.http_headers {
-            headers.insert(
-                reqwest::header::HeaderName::from_bytes(key.as_bytes()).unwrap(),
-                value.parse().unwrap(),
-            );
+            let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                value.parse(),
+            ) else {
+                log::warn!("Ignoring unusable header {:?} from youtube-dl", key);
+                continue;
+            };
+            headers.insert(name, value);
         }
 
-        let request_builder = HTTP_CLIENT.get(&self.download_url).headers(headers);
-        create_source(config, parsed_download_url, request_builder).await
+        let request_builder = HTTP_CLIENT.get(&self.download_url).headers(headers.clone());
+        create_source(config, parsed_download_url, headers, request_builder).await
     }
 }
 
@@ -244,6 +303,7 @@ pub struct SongMetadata {
 async fn create_source(
     config: &PlayConfig<'_>,
     request_url: url::Url,
+    headers: reqwest::header::HeaderMap,
     request_builder: reqwest::RequestBuilder,
 ) -> Result<Input, Error> {
     let buffer_capacity_bytes = config.buffer_capacity_kb * 1024;
@@ -274,7 +334,7 @@ async fn create_source(
 
     // Start streaming chunks from the remote
     let adapter_stream = if is_mpeg_stream {
-        let stream = hls_chunks(request_url, initial_response, request_builder);
+        let stream = hls_chunks(request_url, headers, initial_response, request_builder);
         let reader = StreamReader::new(stream.try_filter(|chunk| future::ready(!chunk.is_empty())));
         AsyncAdapterStream::new(
             Box::new(AsyncReader::new(Box::pin(reader))),
@@ -339,5 +399,108 @@ where
 
     async fn byte_len(&self) -> Option<u64> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_youtube_url;
+
+    fn normalize(url: &str) -> Option<String> {
+        normalize_youtube_url(&url::Url::parse(url).unwrap())
+    }
+
+    #[test]
+    fn keeps_the_video_id_from_a_watch_url() {
+        assert_eq!(
+            normalize("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string())
+        );
+    }
+
+    #[test]
+    fn drops_tracking_and_playlist_position_parameters() {
+        assert_eq!(
+            normalize("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123&index=4&t=30s"),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string())
+        );
+    }
+
+    #[test]
+    fn finds_the_video_id_wherever_it_appears() {
+        assert_eq!(
+            normalize("https://www.youtube.com/watch?list=PL123&v=dQw4w9WgXcQ"),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string())
+        );
+    }
+
+    #[test]
+    fn keeps_playlists_as_playlists() {
+        assert_eq!(
+            normalize("https://www.youtube.com/playlist?list=PL123"),
+            Some("https://www.youtube.com/playlist?list=PL123".to_string())
+        );
+    }
+
+    #[test]
+    fn expands_short_links() {
+        assert_eq!(
+            normalize("https://youtu.be/dQw4w9WgXcQ"),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string())
+        );
+        assert_eq!(
+            normalize("https://youtu.be/dQw4w9WgXcQ?si=abc123&t=30"),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string())
+        );
+    }
+
+    #[test]
+    fn handles_mobile_and_music_subdomains() {
+        assert_eq!(
+            normalize("https://m.youtube.com/watch?v=dQw4w9WgXcQ"),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string())
+        );
+        assert_eq!(
+            normalize("https://music.youtube.com/watch?v=dQw4w9WgXcQ"),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string())
+        );
+    }
+
+    /// These used to panic on an out-of-bounds index into the query parameters.
+    #[test]
+    fn passes_through_youtube_urls_without_parameters() {
+        for url in [
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/live/dQw4w9WgXcQ",
+            "https://www.youtube.com/embed/dQw4w9WgXcQ",
+            "https://www.youtube.com/@somechannel",
+            "https://www.youtube.com/@somechannel/videos",
+            "https://www.youtube.com/",
+            "https://www.youtube.com/watch",
+            "https://www.youtube.com/watch?feature=share",
+            "https://youtu.be/",
+        ] {
+            assert_eq!(normalize(url), None, "{}", url);
+        }
+    }
+
+    #[test]
+    fn leaves_other_hosts_alone() {
+        for url in [
+            "https://soundcloud.com/artist/track",
+            "https://www.twitch.tv/somebody",
+            "https://notyoutube.com/watch?v=dQw4w9WgXcQ",
+            "https://example.com/youtube.com/watch?v=dQw4w9WgXcQ",
+        ] {
+            assert_eq!(normalize(url), None, "{}", url);
+        }
+    }
+
+    #[test]
+    fn escapes_ids_it_puts_back_into_a_url() {
+        assert_eq!(
+            normalize("https://youtu.be/not%20an%20id%26v%3Dother"),
+            Some("https://www.youtube.com/watch?v=not+an+id%26v%3Dother".to_string())
+        );
     }
 }

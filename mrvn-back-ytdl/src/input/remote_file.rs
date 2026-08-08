@@ -48,9 +48,11 @@ pub fn remote_file_chunks(
             response = request_builder
                 .try_clone()
                 .unwrap()
+                // Open-ended: the end of a byte range is inclusive, so naming content_length
+                // here asks for one byte past the end and strict hosts answer with a 416.
                 .header(
                     reqwest::header::RANGE,
-                    format!("bytes={}-{}", received_bytes, content_length),
+                    format!("bytes={}-", received_bytes),
                 )
                 .send()
                 .await
