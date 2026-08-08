@@ -14,6 +14,11 @@
   "host_blocklist": [],
   "ytdl": {
     "name": "youtube-dl",
+    "update": {
+      "enabled": true,
+      "channel": "stable",
+      "check_interval_secs": 21600
+    },
     "args": [
       "--js-runtimes",
       "deno:/usr/local/bin/deno",

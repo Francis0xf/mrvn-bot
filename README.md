@@ -88,7 +88,9 @@ First off you need to setup your environment:
       as [Deno](https://deno.com/) for sites that need one. The `ytdl.name`
       field in your config file must match the name of the binary — the example
       config says `youtube-dl`, which is the name the Docker image installs
-      yt-dlp under.
+      yt-dlp under. Install one of
+      [the standalone builds](https://github.com/yt-dlp/yt-dlp/releases) if you
+      want MRVN to keep yt-dlp up to date for you, as described below.
  2. Clone the repository by running `git clone https://github.com/cpdt/mrvn-bot`
 
 Once that's done, you can run the following command from inside the repository any time you want to start MRVN. Make sure to replace `/path/to/config.json` with the path to your configuration file saved previously.
@@ -102,6 +104,47 @@ The first time this runs it will build MRVN, which can take a while. After it's 
 If you want to see logging output, set the `RUST_LOG` environment variable to `mrvn` before running the above command. This uses [the syntax from the env-logger library](https://docs.rs/env_logger/0.9.0/env_logger/index.html#enabling-logging).
 
 You can stop MRVN by pressing Ctrl+C in the terminal window.
+
+## Keeping yt-dlp up to date
+
+Sites change how they serve audio far more often than MRVN releases, and a
+yt-dlp that is a few weeks old will eventually stop resolving songs. Rather than
+tying that to how recently you pulled a new image, MRVN runs yt-dlp's own
+updater: once at startup, then on an interval. Failures are logged and ignored,
+so a machine that can't reach GitHub keeps playing with the version it has.
+
+This is configured under `ytdl.update` in your config file:
+
+```json
+"ytdl": {
+  "name": "youtube-dl",
+  "update": {
+    "enabled": true,
+    "channel": "stable",
+    "check_interval_secs": 21600
+  }
+}
+```
+
+ - `enabled` turns updates off if you would rather manage yt-dlp yourself. It
+   defaults to `true`, so a config written before this option existed gets
+   updates.
+ - `channel` is passed to yt-dlp as `--update-to`. As well as the `stable`,
+   `nightly` and `master` channels it accepts a specific version
+   (`stable@2026.07.04`), or a GitHub repository to pull builds from instead of
+   the official one (`my-org/yt-dlp`), which is useful if you mirror releases
+   or run a fork.
+ - `check_interval_secs` is how long to wait between checks. Set it to `0` to
+   only update at startup.
+
+Only the standalone yt-dlp binaries can update themselves, which is what the
+Docker image installs. If you installed yt-dlp with pip or a distro package
+manager, updates will fail with a warning on every check — use whatever
+installed it, and set `enabled` to `false`.
+
+Updates in the Docker image are written into the container, so recreating it
+starts again from the version baked into the image. That's fine, it just means
+each fresh container downloads yt-dlp once on startup.
 
 ## Why?
 

@@ -17,9 +17,50 @@ pub struct VoiceBot {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct YtdlUpdateConfig {
+    #[serde(default = "default_update_enabled")]
+    pub enabled: bool,
+
+    /// A yt-dlp `--update-to` target: a channel (`stable`, `nightly`, `master`), a `channel@tag`
+    /// pair, or an `owner/repo` GitHub repository to pull builds from instead of the official one.
+    #[serde(default = "default_update_channel")]
+    pub channel: String,
+
+    #[serde(default = "default_update_check_interval_secs")]
+    pub check_interval_secs: u64,
+}
+
+fn default_update_enabled() -> bool {
+    true
+}
+
+fn default_update_channel() -> String {
+    "stable".to_string()
+}
+
+fn default_update_check_interval_secs() -> u64 {
+    // Stable releases are roughly monthly, but a site change can make a release urgent, and
+    // checking costs one API call.
+    6 * 60 * 60
+}
+
+impl Default for YtdlUpdateConfig {
+    fn default() -> Self {
+        YtdlUpdateConfig {
+            enabled: default_update_enabled(),
+            channel: default_update_channel(),
+            check_interval_secs: default_update_check_interval_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct YtdlConfig {
     pub name: String,
     pub args: Vec<String>,
+
+    #[serde(default)]
+    pub update: YtdlUpdateConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]

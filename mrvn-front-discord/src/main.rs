@@ -14,6 +14,7 @@ mod message;
 mod playing_message;
 mod queued_message;
 mod queued_song;
+mod update_loop;
 mod voice_handler;
 
 #[tokio::main]
@@ -42,6 +43,10 @@ async fn main() {
     let config_file = std::fs::File::open(config_file_path).expect("Unable to open config file");
     let config: Arc<config::Config> =
         Arc::new(serde_json::from_reader(config_file).expect("Unable to read config file"));
+
+    // Sites break yt-dlp far more often than we release, so update before reporting a version:
+    // whatever the image or package shipped with is only a floor.
+    update_loop::update_ytdl_now(&config).await;
 
     let ytdl_version = get_ytdl_version(&config.get_play_config())
         .await
@@ -93,10 +98,15 @@ async fn main() {
     let cleanup_loop_future =
         cleanup_loop::cleanup_loop(frontend, command_client.cache.clone()).map(|_| Ok(()));
 
+    // Same here.
+    #[allow(clippy::result_large_err)]
+    let update_loop_future = update_loop::update_loop(config.clone()).map(|_| Ok(()));
+
     futures::try_join!(
         command_client.start(),
         future::try_join_all(voice_clients.iter_mut().map(|client| client.start())),
         cleanup_loop_future,
+        update_loop_future,
     )
     .expect("Error while running client");
 }
